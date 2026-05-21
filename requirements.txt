@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+requests
+supabase==2.28.3
+midtransclient
+python-telegram-bot
+pytz
+tzlocal==5.3.1
+xlsxwriter==3.2.9
+qrcode
+Pillow
