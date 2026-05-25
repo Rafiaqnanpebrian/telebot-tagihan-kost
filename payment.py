@@ -21,12 +21,17 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 async def payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    
+
     # 1. Ambil data penghuni dari Supabase
     user = supabase.table("users").select("*").eq("chat_id", chat_id).execute()
+
     if not user.data:
-        await context.bot.send_message(chat_id=chat_id, text="Data penghuni tidak ditemukan. Registrasi dulu dengan access code.")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Data penghuni tidak ditemukan. Registrasi dulu dengan access code."
+        )
         return
+
     user_data = user.data[0]
 
     # 2. Ambil tagihan unpaid terbaru
@@ -39,71 +44,97 @@ async def payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         .limit(1)
         .execute()
     )
+
     if not bill.data:
-        await context.bot.send_message(chat_id=chat_id, text="Tidak ada tagihan unpaid.")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Tidak ada tagihan unpaid."
+        )
         return
+
     bill_data = bill.data[0]
 
     # 3. Buat transaksi Midtrans
     order_id = midtrans.generate_order_id(chat_id)
+
     qris_result = midtrans.create_qris_payment(
         order_id=order_id,
         amount=bill_data["amount"],
         customer_name=user_data["full_name"]
     )
 
+    if not qris_result.get("success"):
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"❌ Gagal membuat pembayaran QRIS: {qris_result.get('message')}"
+        )
+        return
+
+    # 4. Buat tombol cancel setelah order_id tersedia
     keyboard = [
         [
-            InlineKeyboardButton("❌ Batalkan Pembayaran",
-            callback_data=f"cancel_payment:{order_id}")
+            InlineKeyboardButton(
+                "❌ Batalkan Pembayaran",
+                callback_data=f"cancel_payment:{order_id}"
+            )
         ]
     ]
+
     start_markup = InlineKeyboardMarkup(keyboard)
 
-    if qris_result.get("success"):
-        # Simpan transaksi ke Supabase
-        supabase.table("transactions").insert({
-            "bill_id": bill_data["bill_id"],
-            "order_id": order_id,
-            "transaction_id": qris_result["transaction_id"],
-            "payment_url": qris_result["payment_url"],
-            "qr_string": qris_result["qr_string"],
-            "payment_status": qris_result["status"],
-            "gross_amount": bill_data["amount"],
-            "payment_method": qris_result.get("raw_response", {}).get("payment_type"),
-            "transaction_time": qris_result.get("transaction_time") or qris_result.get("raw_response", {}).get("transaction_time")
-        }).execute()
+    # 5. Generate gambar QRIS
+    qr_image_result = midtrans.generate_qr_image(
+        qr_string=qris_result["qr_string"],
+        customer_name=user_data["full_name"],
+        amount=bill_data["amount"],
+        order_id=order_id
+    )
 
-        # 4. Kirim QR code ke user
-        qr_image_result = midtrans.generate_qr_image(
-            qr_string=qris_result["qr_string"],
-            customer_name=user_data["full_name"],
-            amount=bill_data["amount"],
-            order_id=order_id
+    if not qr_image_result.get("success"):
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="QRIS berhasil dibuat, tapi gagal generate QR image."
         )
+        return
 
-        if qr_image_result["success"]:
-            await context.bot.send_photo(
-                chat_id=chat_id,
-                photo=qr_image_result["image_bytes"],
-                caption=(
-                    f"🏠 **TAGIHAN KOST**\n\n"
-                    f"Halo {user_data['full_name']}, ini tagihan kost Anda:\n\n"
-                    f"📅 Tanggal: {bill_data['bill_date']}\n"
-                    f"💰 Jumlah: Rp{bill_data['amount']:,}\n"
-                    f"🔢 Order ID: {order_id}\n\n"
-                    f"💳 **PEMBAYARAN QRIS**\n"
-                    f"Scan QR Code di atas atau klik link:\n"
-                    f"🔗 {qris_result['payment_url']}\n\n"
-                ),
-                reply_markup=start_markup,
-                parse_mode="Markdown"
-            )
-        else:
-            await context.bot.send_message(chat_id=chat_id, text="QRIS berhasil dibuat, tapi gagal generate QR image.")
-    else:
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ Gagal membuat pembayaran QRIS: {qris_result.get('message')}")
+    # 6. Kirim QRIS ke Telegram dan simpan message_id
+    sent_message = await context.bot.send_photo(
+        chat_id=chat_id,
+        photo=qr_image_result["image_bytes"],
+        caption=(
+            f"🏠 **TAGIHAN KOST**\n\n"
+            f"Halo {user_data['full_name']}, ini tagihan kost Anda:\n\n"
+            f"📅 Tanggal: {bill_data['bill_date']}\n"
+            f"💰 Jumlah: Rp{bill_data['amount']:,}\n"
+            f"🔢 Order ID: {order_id}\n\n"
+            f"💳 **PEMBAYARAN QRIS**\n"
+            f"Scan QR Code di atas atau klik link:\n"
+            f"🔗 {qris_result['payment_url']}\n\n"
+        ),
+        reply_markup=start_markup,
+        parse_mode="Markdown"
+    )
 
+    # 7. Simpan transaksi ke Supabase setelah sent_message tersedia
+    supabase.table("transactions").insert({
+        "bill_id": bill_data["bill_id"],
+        "order_id": order_id,
+        "transaction_id": qris_result["transaction_id"],
+        "payment_url": qris_result["payment_url"],
+        "qr_string": qris_result["qr_string"],
+        "payment_status": qris_result.get("status", "pending"),
+        "gross_amount": bill_data["amount"],
+        "payment_method": qris_result.get("raw_response", {}).get("payment_type", "qris"),
+        "transaction_time": qris_result.get("transaction_time") or qris_result.get("raw_response", {}).get("transaction_time"),
+        "telegram_message_id": sent_message.message_id,
+        "telegram_chat_id": chat_id,
+    }).execute()
+
+    # 8. Update status tagihan menjadi pending
+    supabase.table("bills").update({
+        "bill_status": "pending"
+    }).eq("bill_id", bill_data["bill_id"]).execute()
+           
 async def cancel_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
