@@ -1,5 +1,6 @@
 import os
 import hashlib
+import logging
 import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException
@@ -11,11 +12,14 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 MIDTRANS_SERVER_KEY = os.getenv("MIDTRANS_SERVER_KEY", "").strip()
+ADMIN_GROUP_CHAT_ID = int(os.getenv("ADMIN_GROUP_CHAT_ID", "-1003928338840"))
+LIVE_TRANSACTIONS_TOPIC_ID = int(os.getenv("LIVE_TRANSACTIONS_TOPIC_ID", "2"))
 
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 app = FastAPI()
+logger = logging.getLogger(__name__)
 
 
 def verify_midtrans_signature(order_id, status_code, gross_amount, signature_key):
@@ -24,21 +28,77 @@ def verify_midtrans_signature(order_id, status_code, gross_amount, signature_key
     return expected_signature == signature_key
 
 
-def send_telegram_message(chat_id, message):
+def send_telegram_message(
+    chat_id,
+    message,
+    message_thread_id=None,
+    parse_mode="Markdown",
+):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
     payload = {
         "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "Markdown"
+        "text": message
     }
+    if message_thread_id is not None:
+        payload["message_thread_id"] = message_thread_id
+    if parse_mode is not None:
+        payload["parse_mode"] = parse_mode
 
     try:
         response = requests.post(url, json=payload, timeout=30)
-        return response.json()
-    except Exception as e:
-        print(f"Gagal kirim pesan Telegram: {e}")
+    except requests.RequestException as e:
+        logger.error(
+            "Telegram send request failed: error_type=%s chat_id=%s "
+            "message_thread_id=%s",
+            type(e).__name__,
+            chat_id,
+            message_thread_id,
+        )
         return None
+
+    try:
+        result = response.json()
+    except ValueError:
+        logger.error(
+            "Telegram returned a non-JSON response: http_status=%s "
+            "chat_id=%s message_thread_id=%s",
+            response.status_code,
+            chat_id,
+            message_thread_id,
+        )
+        return None
+
+    if not response.ok or not isinstance(result, dict) or not result.get("ok"):
+        description = (
+            result.get("description", "Telegram returned ok=false")
+            if isinstance(result, dict)
+            else "Unexpected Telegram response"
+        )
+        logger.error(
+            "Telegram rejected message: http_status=%s chat_id=%s "
+            "message_thread_id=%s description=%s",
+            response.status_code,
+            chat_id,
+            message_thread_id,
+            description,
+        )
+        return None
+
+    telegram_message = result.get("result")
+    message_id = (
+        telegram_message.get("message_id")
+        if isinstance(telegram_message, dict)
+        else None
+    )
+    logger.info(
+        "Telegram message sent: chat_id=%s message_thread_id=%s message_id=%s",
+        chat_id,
+        message_thread_id,
+        message_id,
+    )
+    return result
+
 
 def delete_telegram_message(chat_id, message_id):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage"
@@ -69,8 +129,6 @@ def format_rupiah(amount):
 async def midtrans_notification(request: Request):
     payload = await request.json()
 
-    print("Midtrans notification received:", payload)
-
     order_id = payload.get("order_id")
     transaction_status = payload.get("transaction_status")
     fraud_status = payload.get("fraud_status")
@@ -80,6 +138,12 @@ async def midtrans_notification(request: Request):
     payment_type = payload.get("payment_type")
     settlement_time = payload.get("settlement_time")
     transaction_time = payload.get("transaction_time")
+
+    logger.info(
+        "Midtrans notification received: order_id=%s transaction_status=%s",
+        order_id,
+        transaction_status,
+    )
 
     if not order_id:
         raise HTTPException(status_code=400, detail="order_id tidak ditemukan")
@@ -160,7 +224,7 @@ async def midtrans_notification(request: Request):
     user = user_response.data[0]
 
     chat_id = user.get("chat_id")
-    full_name = user.get("full_name", "Penghuni")
+    full_name = user.get("full_name") or "Penghuni"
 
     # Mapping status Midtrans ke status sistem
     new_payment_status = transaction_status
@@ -194,6 +258,29 @@ async def midtrans_notification(request: Request):
         new_payment_status = "deny"
         new_bill_status = "unpaid"
 
+    is_successful_payment = (
+        transaction_status == "settlement"
+        or (transaction_status == "capture" and fraud_status == "accept")
+    )
+    room_number = None
+    if is_successful_payment:
+        room_id = bill.get("room_id")
+        if room_id is not None:
+            room_response = (
+                supabase.table("rooms")
+                .select("room_number")
+                .eq("room_id", room_id)
+                .limit(1)
+                .execute()
+            )
+            if room_response.data:
+                room_number = room_response.data[0].get("room_number")
+        if not room_number:
+            print(
+                f"Nomor kamar tidak ditemukan untuk bill_id={bill_id}, "
+                f"room_id={room_id}"
+            )
+
     # Update transactions sesuai schema Anda
     trx_update_data = {
         "payment_status": new_payment_status,
@@ -226,7 +313,7 @@ async def midtrans_notification(request: Request):
         delete_telegram_message(telegram_chat_id, telegram_message_id)
 
     if chat_id:
-        if new_bill_status == "paid":
+        if is_successful_payment:
             message = (
                 f"✅ *Pembayaran Berhasil*\n\n"
                 f"Halo {full_name}, pembayaran tagihan kost Anda berhasil dikonfirmasi.\n\n"
@@ -260,6 +347,54 @@ async def midtrans_notification(request: Request):
                 f"Gunakan /bayar untuk membuat QRIS baru."
             )
             send_telegram_message(chat_id, message)
+
+    if is_successful_payment:
+        paid_at = settlement_time or transaction_time or "-"
+        admin_message = (
+            f"✅ Pembayaran Tagihan Berhasil\n\n"
+            f"👤 Penghuni: {full_name}\n"
+            f"🚪 Kamar: {room_number or 'Tidak diketahui'}\n"
+            f"📅 Tanggal tagihan: {bill_date}\n"
+            f"💰 Nominal: {format_rupiah(amount)}\n"
+            f"🕒 Waktu pembayaran: {paid_at}\n"
+            f"🔢 Order ID: {order_id}"
+        )
+        logger.info(
+            "Sending admin live transaction notification: order_id=%s "
+            "chat_id=%s topic_id=%s",
+            order_id,
+            ADMIN_GROUP_CHAT_ID,
+            LIVE_TRANSACTIONS_TOPIC_ID,
+        )
+        admin_result = send_telegram_message(
+            ADMIN_GROUP_CHAT_ID,
+            admin_message,
+            message_thread_id=LIVE_TRANSACTIONS_TOPIC_ID,
+            parse_mode=None,
+        )
+        if admin_result:
+            telegram_message = admin_result.get("result")
+            message_id = (
+                telegram_message.get("message_id")
+                if isinstance(telegram_message, dict)
+                else None
+            )
+            logger.info(
+                "Admin live transaction notification delivered: order_id=%s "
+                "chat_id=%s topic_id=%s message_id=%s",
+                order_id,
+                ADMIN_GROUP_CHAT_ID,
+                LIVE_TRANSACTIONS_TOPIC_ID,
+                message_id,
+            )
+        else:
+            logger.error(
+                "Admin live transaction notification failed: order_id=%s "
+                "chat_id=%s topic_id=%s",
+                order_id,
+                ADMIN_GROUP_CHAT_ID,
+                LIVE_TRANSACTIONS_TOPIC_ID,
+            )
 
     return {
         "status": "success",
